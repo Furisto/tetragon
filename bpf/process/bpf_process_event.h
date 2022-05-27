@@ -108,10 +108,7 @@ hlist_bl_unhashed(const struct hlist_bl_node *h)
 static inline __attribute__((always_inline)) int
 d_unhashed(struct dentry *dentry)
 {
-	struct hlist_bl_node d_hash;
-
-	probe_read(&d_hash, sizeof(d_hash), _(&dentry->d_hash));
-	return hlist_bl_unhashed(&d_hash);
+	return hlist_bl_unhashed(_(&dentry->d_hash));
 }
 
 static inline __attribute__((always_inline)) int
@@ -193,8 +190,8 @@ prepend_path(const struct path *path, const struct path *root, char **buffer,
 	for (i = 0; i < PROBE_CWD_READ_ITERATIONS; ++i) {
 		struct dentry *parent;
 		struct dentry *vfsmnt_mnt_root;
-		struct dentry *root_dentry;
 		struct vfsmount *root_mnt;
+		struct dentry *root_dentry;
 
 		probe_read(&root_dentry, sizeof(root_dentry), _(&root->dentry));
 		probe_read(&root_mnt, sizeof(root_mnt), _(&root->mnt));
@@ -205,24 +202,18 @@ prepend_path(const struct path *path, const struct path *root, char **buffer,
 			   _(&vfsmnt->mnt_root));
 		if (dentry == vfsmnt_mnt_root || IS_ROOT(dentry)) {
 			struct mount *parent;
-#ifdef __LARGE_BPF_PROG
 			struct mnt_namespace *mnt_ns;
-#endif
 
 			probe_read(&parent, sizeof(parent),
 				   _(&mnt->mnt_parent));
 
 			/* Escaped? */
-#ifdef __LARGE_BPF_PROG
-			probe_read(&vfsmnt_mnt_root, sizeof(vfsmnt_mnt_root),
-				   _(&vfsmnt->mnt_root));
-#endif
-			if (dentry != vfsmnt_mnt_root) {
-				bptr = *buffer;
-				blen = *buflen;
-				error = 3;
-				break;
-			}
+			//	if (dentry != vfsmnt_mnt_root) {
+			//		bptr = *buffer;
+			//		blen = *buflen;
+			//		error = 3;
+			//		break;
+			//	}
 
 			/* Global root? */
 			if (mnt != parent) {
@@ -234,20 +225,15 @@ prepend_path(const struct path *path, const struct path *root, char **buffer,
 				continue;
 			}
 
-#ifdef __LARGE_BPF_PROG
-			/* open-coded is_mounted() to use local mnt_ns */
 			probe_read(&mnt_ns, sizeof(mnt_ns), _(&mnt->mnt_ns));
+			/* open-coded is_mounted() to use local mnt_ns */
 			if (!IS_ERR_OR_NULL(mnt_ns) && !is_anon_ns(mnt_ns))
 				error = 1; // absolute root
 			else
 				error = 2; // detached or not attached yet
-#else
-			error = 4;
-#endif
 			break;
 		}
-		probe_read(&parent, sizeof(parent),
-			   _(&dentry->d_parent)); // parent = dentry->d_parent;
+		probe_read(&parent, sizeof(parent), _(&dentry->d_parent));
 		probe_read(&d_name, sizeof(d_name), _(&dentry->d_name));
 		error = prepend_name(&bptr, &blen, (const char *)d_name.name,
 				     d_name.len);
