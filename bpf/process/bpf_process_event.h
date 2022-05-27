@@ -4,6 +4,19 @@
 #ifndef _BPF_PROCESS_EVENT__
 #define _BPF_PROCESS_EVENT__
 
+#define ENAMETOOLONG 36 /* File name too long */
+
+#define MAX_ERRNO 4095
+#define IS_ERR_VALUE(x)                                                        \
+	unlikely((unsigned long)(void *)(x) >= (unsigned long)-MAX_ERRNO)
+
+struct bpf_map_def __attribute__((section("maps"), used)) buffer_heap_map = {
+	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+	.key_size = sizeof(int),
+	.value_size = 4096 * sizeof(char),
+	.max_entries = 1,
+};
+
 static inline __attribute__((always_inline)) __u64
 __get_auid(struct task_struct *task)
 {
@@ -275,6 +288,236 @@ get_full_path(struct path *path, void *argp, u32 offset, u32 *flags)
 		*flags |= UNRESOLVED_MOUNT_POINTS;
 
 	return offset;
+}
+
+static inline __attribute__((always_inline)) bool
+IS_ERR_OR_NULL(const void *ptr)
+{
+	return unlikely(!ptr) || IS_ERR_VALUE((unsigned long)ptr);
+}
+
+static inline __attribute__((always_inline)) bool IS_ROOT(struct dentry *dentry)
+{
+	struct dentry *d_parent;
+
+	probe_read(&d_parent, sizeof(d_parent), _(&dentry->d_parent));
+	return (dentry == d_parent);
+}
+
+static inline __attribute__((always_inline)) bool
+is_anon_ns(struct mnt_namespace *ns)
+{
+	u64 seq;
+
+	probe_read(&seq, sizeof(seq), _(&ns->seq));
+	return seq == 0;
+}
+
+static inline __attribute__((always_inline)) bool
+hlist_bl_unhashed(const struct hlist_bl_node *h)
+{
+	struct hlist_bl_node **pprev;
+
+	probe_read(&pprev, sizeof(pprev), _(&h->pprev));
+	return !pprev;
+}
+
+static inline __attribute__((always_inline)) int
+d_unhashed(struct dentry *dentry)
+{
+	struct hlist_bl_node d_hash;
+
+	probe_read(&d_hash, sizeof(d_hash), _(&dentry->d_hash));
+	return hlist_bl_unhashed(&d_hash);
+}
+
+static inline __attribute__((always_inline)) int
+d_unlinked(struct dentry *dentry)
+{
+	return d_unhashed(dentry) && !IS_ROOT(dentry);
+}
+
+static inline __attribute__((always_inline)) int
+prepend_name(char **buffer, int *buflen, const char *name, u32 dlen)
+{
+	char *bf;
+	int zero = 0;
+	char slash = '/';
+	u64 buffer_offset;
+
+	if (buffer == 0)
+		return -ENAMETOOLONG;
+
+	bf = map_lookup_elem(&buffer_heap_map, &zero);
+	if (!bf)
+		return -ENAMETOOLONG;
+
+	buffer_offset = (u64)(*buffer) - (u64)bf;
+
+	*buflen -= (dlen + 1);
+	if (*buflen < 0)
+		return -ENAMETOOLONG;
+
+	buffer_offset -= (dlen + 1);
+
+	if (dlen > 255)
+		return -ENAMETOOLONG;
+	if (buffer_offset > 4096 - 256)
+		return -ENAMETOOLONG;
+
+	probe_read(bf + buffer_offset, sizeof(char), &slash);
+	asm volatile("%[dlen] &= 0xff;\n" ::[dlen] "+r"(dlen) :);
+	probe_read(bf + buffer_offset + 1, dlen * sizeof(char), name);
+
+	*buffer = bf + buffer_offset;
+	return 0;
+}
+
+static inline __attribute__((always_inline)) int
+prepend(char **buffer, int *buflen, const char *str, int namelen)
+{
+	*buflen -= namelen;
+	if (*buflen < 0)
+		return -ENAMETOOLONG;
+	*buffer -= namelen;
+	memcpy(*buffer, str, namelen);
+	return 0;
+}
+
+static inline __attribute__((always_inline)) int
+prepend_path(const struct path *path, const struct path *root, char **buffer,
+	     int *buflen)
+{
+	struct dentry *dentry;
+	struct vfsmount *vfsmnt;
+	struct mount *mnt;
+	struct qstr d_name;
+	int error = 0;
+	char *bptr;
+	int blen;
+	int i;
+
+	bptr = *buffer;
+	blen = *buflen;
+	error = 0;
+	probe_read(&dentry, sizeof(dentry), _(&path->dentry));
+	probe_read(&vfsmnt, sizeof(vfsmnt), _(&path->mnt));
+	mnt = real_mount(vfsmnt);
+
+#ifdef __LARGE_BPF_PROG
+	for (i = 0; i < 64; ++i)
+#else
+#pragma unroll
+	for (i = 0; i < 10; ++i)
+#endif
+	{
+		struct dentry *parent;
+		struct dentry *vfsmnt_mnt_root;
+		struct dentry *root_dentry;
+		struct vfsmount *root_mnt;
+
+		probe_read(&root_dentry, sizeof(root_dentry), _(&root->dentry));
+		probe_read(&root_mnt, sizeof(root_mnt), _(&root->mnt));
+		if (!(dentry != root_dentry || vfsmnt != root_mnt))
+			break;
+
+		probe_read(&vfsmnt_mnt_root, sizeof(vfsmnt_mnt_root),
+			   _(&vfsmnt->mnt_root));
+		if (dentry == vfsmnt_mnt_root || IS_ROOT(dentry)) {
+			struct mount *parent;
+#ifdef __LARGE_BPF_PROG
+			struct mnt_namespace *mnt_ns;
+#endif
+
+			probe_read(&parent, sizeof(parent),
+				   _(&mnt->mnt_parent));
+
+			/* Escaped? */
+#ifdef __LARGE_BPF_PROG
+			probe_read(&vfsmnt_mnt_root, sizeof(vfsmnt_mnt_root),
+				   _(&vfsmnt->mnt_root));
+#endif
+			if (dentry != vfsmnt_mnt_root) {
+				bptr = *buffer;
+				blen = *buflen;
+				error = 3;
+				break;
+			}
+
+			/* Global root? */
+			if (mnt != parent) {
+				probe_read(&dentry, sizeof(dentry),
+					   _(&mnt->mnt_mountpoint));
+				mnt = parent;
+				probe_read(&vfsmnt, sizeof(vfsmnt),
+					   _(&mnt->mnt));
+				continue;
+			}
+
+#ifdef __LARGE_BPF_PROG
+			/* open-coded is_mounted() to use local mnt_ns */
+			probe_read(&mnt_ns, sizeof(mnt_ns), _(&mnt->mnt_ns));
+			if (!IS_ERR_OR_NULL(mnt_ns) && !is_anon_ns(mnt_ns))
+				error = 1; // absolute root
+			else
+				error = 2; // detached or not attached yet
+#else
+			error = 4;
+#endif
+			break;
+		}
+		probe_read(&parent, sizeof(parent),
+			   _(&dentry->d_parent)); // parent = dentry->d_parent;
+		probe_read(&d_name, sizeof(d_name), _(&dentry->d_name));
+		error = prepend_name(&bptr, &blen, (const char *)d_name.name,
+				     d_name.len);
+		if (error)
+			break;
+
+		dentry = parent;
+	}
+
+	if (error >= 0 && bptr == *buffer) {
+		if (--blen < 0) {
+			error = -ENAMETOOLONG;
+		} else {
+			// --bptr;
+			// probe_read(bptr, sizeof(char), &slash);
+		}
+	}
+	*buffer = bptr;
+	*buflen = blen;
+	return error;
+}
+
+static inline __attribute__((always_inline)) int
+path_with_deleted(const struct path *path, const struct path *root, char **buf,
+		  int *buflen)
+{
+	struct dentry *dentry;
+
+	prepend(buf, buflen, "\0", 1);
+	probe_read(&dentry, sizeof(dentry), _(&path->dentry));
+	if (d_unlinked(dentry)) {
+		int error = prepend(buf, buflen, " (deleted)", 10);
+
+		if (error)
+			return error;
+	}
+	return prepend_path(path, root, buf, buflen);
+}
+
+static inline __attribute__((always_inline)) char *
+__d_path_local(const struct path *path, char *buf, int *buflen, int *error)
+{
+	char *res = buf + *buflen;
+	struct task_struct *task;
+	struct fs_struct *fs;
+
+	task = (struct task_struct *)get_current_task();
+	probe_read(&fs, sizeof(fs), _(&task->fs));
+	*error = path_with_deleted(path, _(&fs->root), &res, buflen);
+	return res;
 }
 
 static inline __attribute__((always_inline)) int64_t
