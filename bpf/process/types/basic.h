@@ -297,15 +297,44 @@ static inline __attribute__((always_inline)) long copy_path(char *args,
 							    unsigned long arg)
 {
 	int *s = (int *)args;
-	u32 size = 0, flags = 0;
+	int size = 0, flags = 0;
+	char *buffer;
+	int zero = 0;
+	int error = 0;
+	void *curr = &args[4];
 
-	size = get_full_path((void *)arg, &args[4], size, &flags);
-	*s = size;
-	if (size < 0)
-		return filter;
-	else if (size == 0)
+	buffer = map_lookup_elem(&buffer_heap_map, &zero);
+	if (!buffer)
 		return 0;
-	size += 4;
+
+	size = 256;
+	buffer = __d_path_local((void *)arg, buffer, &size, &error);
+	if (!buffer)
+		return 0;
+	if (size > 0)
+		size = 256 - size - 1;
+	if (size == 0 || error != 0)
+		return filter;
+
+	// probe_read(curr, size, buffer);
+	// *s = size;
+	// size += 4;
+	asm volatile goto("r1 = *(u64 *)%[pid];\n"
+			  "r2 = *(u32 *)%[flags];\n"
+			  "if r2 s< 0 goto %l[a];\n"
+			  "if r2 s> 255 goto %l[a];\n"
+			  "*(u32 *)%[sz] = r2;\n" // *s = size;
+			  "r3 = *(u64 *)%[buffer];\n"
+			  "call 4;\n"
+			  "r7 = *(u32 *)%[flags];\n"
+			  "r7 += 4;\n" // size += 4;
+			  "*(u32 *)%[flags] = r7;\n"
+			  :
+			  : [pid] "m"(curr), [flags] "+m"(size),
+			    [buffer] "+m"(buffer), [sz] "m"(*s)
+			  : "r0", "r1", "r2", "r3", "r7", "memory"
+			  : a);
+a:
 
 	/*
 	 * the format of the path is:
@@ -317,8 +346,8 @@ static inline __attribute__((always_inline)) long copy_path(char *args,
 	 */
 	asm volatile goto("r1 = *(u64 *)%[pid];\n"
 			  "r7 = *(u32 *)%[offset];\n"
-			  "if r7 s< 0 goto %l[a];\n"
-			  "if r7 s> 1188 goto %l[a];\n"
+			  "if r7 s< 0 goto %l[b];\n"
+			  "if r7 s> 1188 goto %l[b];\n"
 			  "r1 += r7;\n"
 			  "r2 = *(u32 *)%[flags];\n"
 			  "*(u32 *)(r1 + 0) = r2;\n"
@@ -326,10 +355,12 @@ static inline __attribute__((always_inline)) long copy_path(char *args,
 			  : [pid] "m"(args), [flags] "m"(flags),
 			    [offset] "+m"(size)
 			  : "r0", "r1", "r2", "r7", "memory"
-			  : a);
-a:
+			  : b);
+b:
+	s = (int *)args; // restore the size from memory // needed in 4.19
+	size = *s; // get the original value
+	size += 4; // increase by 4 from the first assembly block
 	size += sizeof(u32); // for the flags
-
 	return size;
 }
 
